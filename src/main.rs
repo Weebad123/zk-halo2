@@ -4,11 +4,11 @@ use std::{marker::PhantomData};
 use halo2_proofs::{
     circuit::{ AssignedCell, Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
-    plonk::{self, Advice, Circuit, Column, ConstraintSystem, Error, Selector},
+    plonk::{self, Advice, Circuit, Column, ConstraintSystem, Error, Selector, Fixed},
     poly::Rotation
 };
 
-use ff::Field;
+use ff::{Field, PrimeField};
 
 
 
@@ -41,14 +41,18 @@ struct MulConfig<F: Field + Clone> {
 
     q_add_enable: Selector,
 
+    q_fixed_enable: Selector,
+
     advice: Column<Advice>,
+
+    fixed: Column<Fixed>,
 
     _ph: PhantomData<F>,
 }
 
 
 // STEP 3: Implement the Circuit Struct and its methods on my MulStruct
-impl<F: Field> Circuit<F> for MulCircuit<F> {
+impl<F: PrimeField> Circuit<F> for MulCircuit<F> {
 
     // I == Define your types for the config and the intended layout (SimpleFloorPlanner)
     type Config = MulConfig<F>;
@@ -68,11 +72,24 @@ impl<F: Field> Circuit<F> for MulCircuit<F> {
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
         
-        // a) Add 2 Columns to the circuit: Selector and Advice Columns
+        // a) Add 2 Columns to the circuit: 2 Selectors and Advice Columns
         let q_mul_enable = meta.complex_selector();
         let q_add_enable = meta.complex_selector();
-        let advice = meta.advice_column();
 
+        let q_fixed_enable = meta.complex_selector();
+
+
+        let advice = meta.advice_column();
+        // Add Fixed Column
+        let fixed = meta.fixed_column();
+
+        // To Enforce Equality Constraints, we need to enable equality constraints
+        // on that specified column ( in this case, the advice column), and then enforce 
+        //equality on the cells during the advice assignment
+        meta.enable_equality(advice);
+
+        // Enable Equality For The Fixed Column as well
+        meta.enable_constant(fixed);
 
         // b) Define a new Gate
         meta.create_gate("vertical-mul", |meta| {
@@ -99,13 +116,27 @@ impl<F: Field> Circuit<F> for MulCircuit<F> {
             vec![q_add_enable * (w0 + w1 - w2)]
         });
 
+        // c) Define a New Gate For The Fixed Column That Checks A Cell Against A Constant
+        meta.create_gate("fixed equal-constant check", |meta| {
+            let w0 = meta.query_advice(advice, Rotation::cur());
+            let c1 = meta.query_fixed(fixed, Rotation::cur());
+            let q_fixed_enable = meta.query_selector(q_fixed_enable);
+
+            // Add Constraint Enforcer
+            vec!(q_fixed_enable * (w0 - c1))
+        });
+
         // Function Returns = the Config struct
         MulConfig {
             q_mul_enable,
 
             q_add_enable,
 
+            q_fixed_enable,
+
             advice,
+
+            fixed,
 
             _ph: PhantomData
         }
@@ -164,14 +195,22 @@ impl<F: Field> Circuit<F> for MulCircuit<F> {
             free_add_var_3.clone(),
             free_add_var_2.clone(),
         )?;
+
+        // Bring In The Fixed Constant implementation here
+        MulCircuit::<F>::fixed(
+            &config,
+            &mut layouter,
+            F::from_u128(4272253717090457),
+            free_variable_5
+        )?;
         
         Ok(())
     }
 }
 
 
-// OPTIONAL STEP:    Let's implement Some Other methods
-impl<F: Field> MulCircuit<F> {
+// OPTIONAL STEP:    Let's implement Some Other methods To Be Called In The Synthesize
+impl<F: PrimeField> MulCircuit<F> {
 
     // This region occupies 3 rows
     #[allow(unused_variables)]
@@ -217,6 +256,10 @@ impl<F: Field> MulCircuit<F> {
 
                 // b) Turn ON The Gate
                 config.q_mul_enable.enable(&mut region, 0)?;
+
+                // Introduce Equality Enforcements Here : Ensure constraining The correct cells
+                region.constrain_equal(w0.cell(), lhs.cell())?;
+                region.constrain_equal(w1.cell(), rhs.cell())?;
                 Ok(w2)
             },
         )
@@ -268,6 +311,76 @@ impl<F: Field> MulCircuit<F> {
         )
     }
 
+    // Implement A Single Approach To Assigning and Enforcing Equality Constraints
+    #[rustfmt::skip]
+    fn mul_sugar(
+        config: &<Self as Circuit<F>>::Config,
+        layouter: &mut impl Layouter<F>,
+        lhs: AssignedCell<F, F>,
+        rhs: AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+
+        layouter.assign_region(
+            ||"mul-sugar",
+            |mut region| {
+                let w0 = lhs.value().cloned();
+                let w1 = rhs.value().cloned();
+                let w2 = 
+                    w0
+                        .and_then(|w0|w1.and_then(|w1| Value::known(w0 * w1)));
+
+                // Copy And Enforce Equality Constraints Between w0/w1 cells and lhs/rhs cells
+                let _w0 = lhs.copy_advice(
+                    ||"assign w0", &mut region, config.advice, 0
+                )?;
+                let _w1 = rhs.copy_advice(
+                    ||"assign w1", &mut region, config.advice, 1
+                )?;
+                let w2 = region.assign_advice(
+                    ||"assign w2", config.advice, 2, ||w2
+                )?;
+
+                config.q_mul_enable.enable(&mut region, 0)?;
+                // ANCHOR_END: copy
+                
+                Ok(w2)
+            }
+        )
+    }
+
+    fn fixed(
+        config: &<Self as Circuit<F>>::Config,
+        layouter: &mut impl Layouter<F>,
+        value: F,
+        variable: AssignedCell<F, F>,
+    ) -> Result<(), Error> {
+
+        layouter.assign_region(
+            || "fixed",
+            |mut region| {
+                variable.copy_advice(
+                    ||"assign variable",
+                    &mut region,
+                    config.advice,
+                    0,
+                )?;
+                let fixed_cell = region.assign_fixed(
+                    || "assign constant",
+                    config.fixed,
+                    0,
+                    || Value::known(value),
+                )?;
+
+                // Turn The Fixed Gate On
+                config.q_fixed_enable.enable(&mut region, 0)?;
+
+                // Equality Constraints On Fixed Cell Below:
+                region.constrain_equal(variable.cell(), fixed_cell.cell())?;
+                Ok(())
+            }
+        )
+    }
+
     // To Use the Mul function, we will need some way to create assigned cells. 
     // Create a function which allocates a small region (1 row), enables no gates
     // and simply returns the cell
@@ -293,7 +406,7 @@ impl<F: Field> MulCircuit<F> {
 }
 
 // Implement Circuit Methods For Malicious Circuit
-impl<F: Field> Circuit<F> for MaliciousCircuit<F> {
+impl<F: PrimeField> Circuit<F> for MaliciousCircuit<F> {
 
     type Config = MulConfig<F>;
     type FloorPlanner = SimpleFloorPlanner;
